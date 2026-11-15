@@ -927,53 +927,62 @@ class YahooMailMCPServer {
                     return;
                 }
 
-                const source = uids.join(',');
-
+                // Pass the array, not uids.join(','): node-imap only fetches the
+                // first UID of a comma-joined string against Yahoo.
                 // CRITICAL: Use imap.fetch() (NOT imap.seq.fetch) for UID-based fetch
-                const fetch = imap.fetch(source, {
+                const fetch = imap.fetch(uids, {
                     bodies: '',
                     struct: true
                 });
 
                 const emails = [];
                 const foundUIDs = new Set();
+                // One promise per message. node-imap can emit the fetch 'end' event
+                // before each message's body stream has drained and before the async
+                // simpleParser callback runs, so we must wait on these before replying.
+                const pending = [];
 
                 fetch.on('message', (msg, seqno) => {
-                    let buffer = '';
+                    const chunks = [];
+                    let bodyDone = Promise.resolve();
                     let attrs = null;
 
-                    msg.on('body', (stream, info) => {
-                        stream.on('data', (chunk) => {
-                            buffer += chunk.toString('ascii');
-                        });
-                    });
-
-                    msg.once('attributes', (attributes) => {
-                        attrs = attributes;
-                        foundUIDs.add(attributes.uid);
-                    });
-
-                    msg.once('end', () => {
-                        simpleParser(buffer, (err, parsed) => {
-                            if (err) {
-                                console.error('Error parsing email:', err);
-                                return;
-                            }
-
-                            emails.push({
-                                uid: attrs.uid,
-                                sequenceNumber: seqno,  // Still include for reference
-                                from: parsed.from?.text || 'Unknown',
-                                to: parsed.to?.text || 'Unknown',
-                                subject: parsed.subject || 'No Subject',
-                                date: parsed.date || 'Unknown Date',
-                                size: attrs.size || 0,
-                                flags: attrs.flags || [],
-                                hasAttachments: this.hasAttachments(attrs.struct),
-                                content: parsed.text || parsed.html || 'No content available'
+                    pending.push(new Promise((resolveMsg) => {
+                        msg.on('body', (stream) => {
+                            bodyDone = new Promise((resolveBody) => {
+                                stream.on('data', (chunk) => chunks.push(chunk));
+                                stream.once('end', resolveBody);
+                                stream.once('error', resolveBody);
                             });
                         });
-                    });
+
+                        msg.once('attributes', (attributes) => {
+                            attrs = attributes;
+                            foundUIDs.add(attributes.uid);
+                        });
+
+                        msg.once('end', async () => {
+                            await bodyDone;
+                            try {
+                                const parsed = await simpleParser(Buffer.concat(chunks));
+                                emails.push({
+                                    uid: attrs?.uid,
+                                    sequenceNumber: seqno,  // Still include for reference
+                                    from: parsed.from?.text || 'Unknown',
+                                    to: parsed.to?.text || 'Unknown',
+                                    subject: parsed.subject || 'No Subject',
+                                    date: parsed.date || 'Unknown Date',
+                                    size: attrs?.size || 0,
+                                    flags: attrs?.flags || [],
+                                    hasAttachments: this.hasAttachments(attrs?.struct),
+                                    content: parsed.text || parsed.html || 'No content available'
+                                });
+                            } catch (parseErr) {
+                                console.error('Error parsing email:', parseErr);
+                            }
+                            resolveMsg();
+                        });
+                    }));
                 });
 
                 fetch.once('error', (err) => {
@@ -981,7 +990,8 @@ class YahooMailMCPServer {
                     reject(err);
                 });
 
-                fetch.once('end', () => {
+                fetch.once('end', async () => {
+                    await Promise.all(pending);
                     imap.end();
 
                     // Check for missing UIDs
